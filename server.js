@@ -15,8 +15,8 @@ const SESSION_DAYS = 90;
 let data = { users: {}, sessions: {} };
 try {
   if (fs.existsSync(DATA_FILE)) data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  data.users = data.users || {}; data.sessions = data.sessions || {};
-  for (const u of Object.values(data.users)) { u.gold = u.gold || 0; u.silver = u.silver || 0; }   // accounts made before rewards existed
+  data.users = data.users || {}; data.sessions = data.sessions || {}; data.orders = data.orders || {};
+  for (const u of Object.values(data.users)) { u.gold = u.gold || 0; u.silver = u.silver || 0; u.swap ??= 1; u.pinwheel ??= 2; u.flowerpot ??= 2; u.life ??= 0; }   // migrate accounts to wallet fields
 } catch (e) {
   console.error('Could not read ' + DATA_FILE + ' - fix or move it, then start again.', e.message);
   process.exit(1);
@@ -57,8 +57,8 @@ const userJson = u => ({
   bigAnimals: u.bigAnimals, biggerAnimals: u.biggerAnimals, goldenAnimals: u.goldenAnimals,
   swapsUsed: u.swapsUsed, pinwheelsUsed: u.pinwheelsUsed, flowerPotsUsed: u.flowerPotsUsed,
   secondsPlayed: u.secondsPlayed,
-  gold: u.gold || 0, silver: u.silver || 0,
-  srv: 3                                   // signed gold/silver deltas are enabled
+  gold: u.gold || 0, silver: u.silver || 0, swap: u.swap ?? 1, pinwheel: u.pinwheel ?? 2, flowerpot: u.flowerpot ?? 2, life: u.life || 0,
+  srv: 4                                   // payment-backed inventory fields are enabled
 });
 
 async function hashPw(pw, salt) { return (await scrypt(pw, salt, 64)).toString('hex'); }
@@ -116,10 +116,10 @@ app.post('/api/register', async (req, res) => {
       id: n.id, kind: n.kind, name, salt, hash, created: nowIso(), lastLogin: nowIso(),
       level: 1, bestScore: 0, totalScore: 0, lives: 5, livesAt: 0, livesUsed: 0, levelsCleared: 0, levelsFailed: 0,
       bigAnimals: 0, biggerAnimals: 0, goldenAnimals: 0, swapsUsed: 0, pinwheelsUsed: 0, flowerPotsUsed: 0, secondsPlayed: 0,
-      gold: 0, silver: 0
+      gold: 0, silver: 0, swap: 1, pinwheel: 2, flowerpot: 2, life: 0
     };
     const token = newSession(n.id);
-    persist();
+    persist(); flushNow();
     res.json({ token, user: userJson(data.users[n.id]) });
   } catch (e) { console.error(e); res.status(500).json({ error: 'Server error.' }); }
 });
@@ -137,7 +137,7 @@ app.post('/api/login', async (req, res) => {
     if (!crypto.timingSafeEqual(Buffer.from(h), Buffer.from(u.hash))) return res.status(401).json({ error: 'Wrong password.' });
     u.lastLogin = nowIso();
     const token = newSession(u.id);
-    persist();
+    persist(); flushNow();
     res.json({ token, user: userJson(u) });
   } catch (e) { console.error(e); res.status(500).json({ error: 'Server error.' }); }
 });
@@ -164,7 +164,7 @@ app.post('/api/logout', auth, (req, res) => { delete data.sessions[req.tokenHash
 app.get('/api/players', auth, (req, res) => {
   const list = Object.values(data.users).map(u => ({
     name: u.name, level: u.level, levelsCleared: u.levelsCleared, bestScore: u.bestScore,
-    gold: u.gold || 0, silver: u.silver || 0, you: u.id === req.user.id
+    gold: u.gold || 0, silver: u.silver || 0, swap: u.swap ?? 1, pinwheel: u.pinwheel ?? 2, flowerpot: u.flowerpot ?? 2, life: u.life || 0, you: u.id === req.user.id
   }));
   list.sort((a, b) => b.level - a.level || b.gold - a.gold || b.silver - a.silver || a.name.localeCompare(b.name));
   res.json({ players: list.slice(0, 100) });
@@ -195,6 +195,78 @@ app.post('/api/sync', auth, (req, res) => {
   if (Number.isFinite(lives) && lives >= 0 && lives <= 5 && Number.isFinite(at) && at > u.livesAt) { u.lives = lives; u.livesAt = at; }
   persist();
   res.json({ user: userJson(u) });
+});
+
+const STORE_SKUS = {
+  powerup_bundle: { amount: 4900, description: 'AniCrash power-up bundle', reward: { swap: 2, pinwheel: 3, flowerpot: 3 } },
+  life_bundle: { amount: 9900, description: 'AniCrash five life vouchers', reward: { life: 5 } },
+  coin_bundle: { amount: 19900, description: 'AniCrash coin bundle', reward: { gold: 50, silver: 2000 } }
+};
+
+function walletSnapshot(u) {
+  return { gold: u.gold || 0, silver: u.silver || 0, lives: u.lives || 0,
+    swap: u.swap ?? 1, pinwheel: u.pinwheel ?? 2, flowerpot: u.flowerpot ?? 2, life: u.life || 0 };
+}
+
+async function razorpayRequest(method, endpoint, body) {
+  const keyId = process.env.RAZORPAY_KEY_ID || '';
+  const keySecret = process.env.RAZORPAY_KEY_SECRET || '';
+  const mode = (process.env.PAYMENTS_MODE || 'test').toLowerCase();
+  if (!keyId || !keySecret) throw Object.assign(new Error('Payment provider is not configured.'), { status: 503 });
+  if ((mode === 'test' && !keyId.startsWith('rzp_test_')) || (mode === 'live' && !keyId.startsWith('rzp_live_'))) throw Object.assign(new Error('Payment key does not match PAYMENTS_MODE.'), { status: 503 });
+  const response = await fetch('https://api.razorpay.com/v1' + endpoint, {
+    method, headers: {
+      Authorization: 'Basic ' + Buffer.from(keyId + ':' + keySecret).toString('base64'),
+      'Content-Type': 'application/json'
+    }, body: body ? JSON.stringify(body) : undefined
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    console.error('Razorpay API error', response.status, payload.error?.code || 'unknown');
+    throw Object.assign(new Error('Payment provider request failed.'), { status: 502 });
+  }
+  return payload;
+}
+
+app.post('/api/store/orders', auth, async (req, res) => {
+  try {
+    if (limited('order:' + req.user.id, 12, 60000)) return res.status(429).json({ error: 'Too many checkout attempts. Try again shortly.' });
+    const sku = String((req.body || {}).sku || '');
+    const product = STORE_SKUS[sku];
+    if (!product) return res.status(400).json({ error: 'Unknown store item.' });
+    const orderId = 'ac_' + crypto.randomBytes(16).toString('hex');
+    const link = await razorpayRequest('POST', '/payment_links', {
+      amount: product.amount, currency: 'INR', accept_partial: false,
+      reference_id: orderId, description: product.description,
+      notify: { sms: false, email: false }, reminder_enable: false,
+      notes: { account_id: req.user.id, order_id: orderId, sku }
+    });
+    if (!link.id || !link.short_url) throw new Error('Payment provider returned an incomplete payment link.');
+    data.orders[orderId] = { id: orderId, accountId: req.user.id, sku, amount: product.amount,
+      currency: 'INR', gateway: 'razorpay', gatewayId: link.id, status: 'created', createdAt: Date.now() };
+    persist(); flushNow();
+    res.status(201).json({ orderId, checkoutUrl: link.short_url, gateway: 'razorpay', status: 'created' });
+  } catch (e) { res.status(e.status || 503).json({ error: e.message || 'Could not create checkout.' }); }
+});
+
+app.post('/api/store/orders/:orderId/verify', auth, async (req, res) => {
+  try {
+    const order = data.orders[req.params.orderId];
+    if (!order || order.accountId !== req.user.id) return res.status(404).json({ error: 'Order not found.' });
+    if (order.status === 'paid') return res.json({ orderId: order.id, verified: true, status: 'paid', wallet: order.wallet });
+    const link = await razorpayRequest('GET', '/payment_links/' + encodeURIComponent(order.gatewayId));
+    if (link.status !== 'paid' || link.amount !== order.amount || link.amount_paid !== order.amount || link.currency !== order.currency) {
+      return res.json({ orderId: order.id, verified: false, status: link.status || 'created' });
+    }
+    if (order.status === 'paid') return res.json({ orderId: order.id, verified: true, status: 'paid', wallet: order.wallet });
+    const product = STORE_SKUS[order.sku];
+    if (!product) return res.status(400).json({ error: 'Store item is no longer available.' });
+    for (const [field, amount] of Object.entries(product.reward)) req.user[field] = (req.user[field] || 0) + amount;
+    order.status = 'paid'; order.paidAt = Date.now(); order.paymentId = link.payments?.[0]?.payment_id || null;
+    order.wallet = walletSnapshot(req.user);
+    persist(); flushNow();
+    res.json({ orderId: order.id, verified: true, status: 'paid', wallet: order.wallet });
+  } catch (e) { res.status(e.status || 503).json({ error: e.message || 'Could not verify payment.' }); }
 });
 
 app.use((req, res) => res.status(404).json({ error: 'Not found.' }));
