@@ -58,7 +58,7 @@ const userJson = u => ({
   swapsUsed: u.swapsUsed, pinwheelsUsed: u.pinwheelsUsed, flowerPotsUsed: u.flowerPotsUsed,
   secondsPlayed: u.secondsPlayed,
   gold: u.gold || 0, silver: u.silver || 0,
-  srv: 2                                   // server version: tells the apps this server keeps gold and silver
+  srv: 3                                   // signed gold/silver deltas are enabled
 });
 
 async function hashPw(pw, salt) { return (await scrypt(pw, salt, 64)).toString('hex'); }
@@ -175,6 +175,7 @@ app.get('/api/players', auth, (req, res) => {
 app.post('/api/sync', auth, (req, res) => {
   const b = req.body || {}, d = b.deltas || {}, u = req.user;
   const num = (v, max) => { v = Math.floor(Number(v)); return Number.isFinite(v) && v > 0 ? Math.min(v, max) : 0; };
+  const currencyDelta = (v, max) => { v = Math.floor(Number(v)); return Number.isFinite(v) ? Math.max(-max, Math.min(v, max)) : 0; };
   u.totalScore += num(d.totalScore, 5e6);
   u.levelsCleared += num(d.levelsCleared, 1000);
   u.levelsFailed += num(d.levelsFailed, 1000);
@@ -186,8 +187,8 @@ app.post('/api/sync', auth, (req, res) => {
   u.pinwheelsUsed += num(d.pinwheelsUsed, 5000);
   u.flowerPotsUsed += num(d.flowerPotsUsed, 5000);
   u.secondsPlayed += num(d.secondsPlayed, 86400);
-  u.gold = (u.gold || 0) + num(d.gold, 100000);
-  u.silver = (u.silver || 0) + num(d.silver, 1000000);
+  u.gold = Math.max(0, Math.min(10000000, (u.gold || 0) + currencyDelta(d.gold, 100000)));
+  u.silver = Math.max(0, Math.min(100000000, (u.silver || 0) + currencyDelta(d.silver, 1000000)));
   u.level = Math.max(u.level, Math.min(num(b.level, 1e6), u.level + 200));
   u.bestScore = Math.max(u.bestScore, num(b.bestScore, 1e8));
   const lives = Math.floor(Number(b.lives)), at = Math.floor(Number(b.livesAt));
