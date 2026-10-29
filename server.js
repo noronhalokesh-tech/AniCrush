@@ -121,7 +121,8 @@ app.disable('x-powered-by');
 app.use(express.json({ limit: '20kb' }));
 
 app.get('/', (req, res) => res.type('text').send('AniCrash server is running'));
-app.get('/health', (req, res) => res.json({ ok: true }));
+const API_VERSION = 2;   // 2 = gold / silver / stock, /api/players and repeat-safe syncs. The apps warn when the server is older.
+app.get('/health', (req, res) => res.json({ ok: true, api: API_VERSION }));
 
 app.post('/api/register', async (req, res) => {
   try {
@@ -187,13 +188,21 @@ app.post('/api/logout', auth, (req, res) => { delete data.sessions[req.tokenHash
 app.post('/api/sync', auth, (req, res) => {
   const b = req.body || {}, d = b.deltas || {}, u = req.user;
   const whole = v => { v = Math.trunc(Number(v)); return Number.isFinite(v) ? v : 0; };
-  for (const [k, max] of Object.entries(TOTALS)) {
-    const v = whole(d[k]);
-    if (v > 0) u[k] += Math.min(v, max);
-  }
-  for (const [k, [, max]] of Object.entries(BALANCES)) {
-    const v = Math.max(-max, Math.min(max, whole(d[k])));
-    if (v !== 0) u[k] = Math.max(0, Math.min(BALANCE_CEILING, u[k] + v));
+  // Every sync carries an id. If the same id arrives again (the device never got our answer and is resending), its changes
+  // are NOT applied a second time - the device just gets the current account back.
+  const rid = typeof b.reqId === 'string' && b.reqId.length > 0 && b.reqId.length <= 64 ? b.reqId : '';
+  if (!Array.isArray(u.applied)) u.applied = [];
+  const again = rid && u.applied.includes(rid);
+  if (!again) {
+    for (const [k, max] of Object.entries(TOTALS)) {
+      const v = whole(d[k]);
+      if (v > 0) u[k] += Math.min(v, max);
+    }
+    for (const [k, [, max]] of Object.entries(BALANCES)) {
+      const v = Math.max(-max, Math.min(max, whole(d[k])));
+      if (v !== 0) u[k] = Math.max(0, Math.min(BALANCE_CEILING, u[k] + v));
+    }
+    if (rid) { u.applied.push(rid); if (u.applied.length > 40) u.applied.splice(0, u.applied.length - 40); }
   }
   const lvl = whole(b.level);
   if (lvl > 0) u.level = Math.max(u.level, Math.min(lvl, u.level + 200));
@@ -202,7 +211,7 @@ app.post('/api/sync', auth, (req, res) => {
   const lives = whole(b.lives), at = whole(b.livesAt);
   if (lives >= 0 && lives <= 5 && at > u.livesAt) { u.lives = lives; u.livesAt = at; }
   persist();
-  res.json({ user: userJson(u) });
+  res.json({ user: userJson(u), api: API_VERSION });
 });
 
 // Everyone's progress, for the level-progress screen. Names and numbers only - never emails or phone numbers.
