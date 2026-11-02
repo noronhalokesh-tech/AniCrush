@@ -164,7 +164,7 @@ if (process.env.TRUST_PROXY) app.set('trust proxy', 1);
 app.disable('x-powered-by');
 app.use(express.json({ limit: '20kb' }));
 
-app.get('/', (req, res) => res.type('text').sendFile(path.join(__dirname, 'public', 'index.html')));
+app.get('/', (req, res) => res.type('text').sendFile(path.join(__dirname,  'index.html')));
 const API_VERSION = 3;   // 3 = coins as earned minus spent, stock, /api/players, repeat-safe syncs. The apps warn when the server is older.
 app.get('/health', (req, res) => res.json({ ok: true, api: API_VERSION }));
 
